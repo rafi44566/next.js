@@ -8,16 +8,16 @@ use turbo_rcstr::RcStr;
 use turbo_tasks::{ResolvedVc, Vc};
 
 use crate::{
+    chunk::chunking_context::UnusedReferences,
     module::Module,
     module_graph::{GraphEdgeIndex, GraphTraversalAction, ModuleGraph},
-    reference::ModuleReference,
     resolve::{ExportUsage, ImportUsage},
 };
 
 #[turbo_tasks::value]
 #[derive(Clone, Default, Debug)]
 pub struct BindingUsageInfo {
-    unused_references: FxHashSet<ResolvedVc<Box<dyn ModuleReference>>>,
+    unused_references: ResolvedVc<UnusedReferences>,
     #[turbo_tasks(trace_ignore)]
     unused_references_edges: FxHashSet<GraphEdgeIndex>,
 
@@ -51,10 +51,6 @@ impl BindingUsageInfo {
         self.unused_references_edges.contains(edge)
     }
 
-    pub fn is_reference_unused(&self, reference: &ResolvedVc<Box<dyn ModuleReference>>) -> bool {
-        self.unused_references.contains(reference)
-    }
-
     pub async fn used_exports(
         &self,
         module: ResolvedVc<Box<dyn Module>>,
@@ -78,6 +74,14 @@ impl BindingUsageInfo {
             is_circuit_breaker,
         }
         .cell())
+    }
+}
+
+#[turbo_tasks::value_impl]
+impl BindingUsageInfo {
+    #[turbo_tasks::function]
+    pub fn unused_references(&self) -> Vc<UnusedReferences> {
+        *self.unused_references
     }
 }
 
@@ -254,7 +258,7 @@ pub async fn compute_binding_usage_info(
         }
 
         Ok(BindingUsageInfo {
-            unused_references,
+            unused_references: ResolvedVc::cell(unused_references),
             unused_references_edges,
             used_exports,
             export_circuit_breakers,
