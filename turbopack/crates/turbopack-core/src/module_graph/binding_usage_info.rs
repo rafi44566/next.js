@@ -126,7 +126,7 @@ pub async fn compute_binding_usage_info(
             );
         }
 
-        let graph = graph.read_graphs().await?;
+        let graph = graph.await?;
 
         let entries = graph.graphs.iter().flat_map(|g| g.entry_modules());
 
