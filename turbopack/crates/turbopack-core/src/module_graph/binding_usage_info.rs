@@ -5,7 +5,7 @@ use auto_hash_map::AutoSet;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::Instrument;
 use turbo_rcstr::RcStr;
-use turbo_tasks::{ResolvedVc, Vc};
+use turbo_tasks::{OperationVc, ResolvedVc, Vc};
 
 use crate::{
     chunk::chunking_context::UnusedReferences,
@@ -87,7 +87,7 @@ impl BindingUsageInfo {
 
 #[turbo_tasks::function(operation)]
 pub async fn compute_binding_usage_info(
-    graph: ResolvedVc<ModuleGraph>,
+    graph: OperationVc<ModuleGraph>,
     remove_unused_imports: bool,
 ) -> Result<Vc<BindingUsageInfo>> {
     let span_outer = tracing::info_span!(
@@ -108,7 +108,8 @@ pub async fn compute_binding_usage_info(
         let mut unused_references_edges = FxHashSet::default();
         let mut unused_references = FxHashSet::default();
 
-        if graph.await?.binding_usage.is_some() {
+        let graph = graph.connect().await?;
+        if graph.binding_usage.is_some() {
             // If the graph already has binding usage info, return it directly. This is
             // unfortunately easy to do with
             // ```
@@ -125,8 +126,6 @@ pub async fn compute_binding_usage_info(
                  without_unused_references"
             );
         }
-
-        let graph = graph.await?;
 
         let entries = graph.graphs.iter().flat_map(|g| g.entry_modules());
 

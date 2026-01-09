@@ -270,7 +270,7 @@ impl SingleModuleGraph {
     /// nodes listed in `visited_modules`
     /// The resulting graph's outgoing edges are in reverse order.
     async fn new_inner(
-        entries: &GraphEntriesT,
+        entries: Vec<ChunkGroupEntry>,
         visited_modules: &FxIndexMap<ResolvedVc<Box<dyn Module>>, GraphNodeIndex>,
         include_traced: bool,
         include_binding_usage: bool,
@@ -759,7 +759,7 @@ pub struct ModuleGraph {
 
 #[turbo_tasks::value_impl]
 impl ModuleGraph {
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(operation)]
     pub async fn from_single_graph(graph: OperationVc<SingleModuleGraph>) -> Result<Vc<Self>> {
         let graph = Self::create(vec![graph], None)
             .read_strongly_consistent()
@@ -767,7 +767,7 @@ impl ModuleGraph {
         Ok(ReadRef::cell(graph))
     }
 
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(operation)]
     pub async fn from_graphs(graphs: Vec<OperationVc<SingleModuleGraph>>) -> Result<Vc<Self>> {
         let graph = Self::create(graphs, None)
             .read_strongly_consistent()
@@ -780,7 +780,23 @@ impl ModuleGraph {
     ///
     /// In particular, this removes ChunkableModuleReference-s that list only unused exports in the
     /// `import_usage()`
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(operation)]
+    pub async fn from_single_graph_without_unused_references(
+        graph: OperationVc<SingleModuleGraph>,
+        binding_usage: OperationVc<BindingUsageInfo>,
+    ) -> Result<Vc<Self>> {
+        let graph = Self::create(vec![graph], Some(binding_usage))
+            .read_strongly_consistent()
+            .await?;
+        Ok(ReadRef::cell(graph))
+    }
+
+    /// Analyze the module graph and remove unused references (by determining the used exports and
+    /// removing unused imports).
+    ///
+    /// In particular, this removes ChunkableModuleReference-s that list only unused exports in the
+    /// `import_usage()`
+    #[turbo_tasks::function(operation)]
     pub async fn from_graphs_without_unused_references(
         graphs: Vec<OperationVc<SingleModuleGraph>>,
         binding_usage: OperationVc<BindingUsageInfo>,
@@ -789,32 +805,6 @@ impl ModuleGraph {
             .read_strongly_consistent()
             .await?;
         Ok(ReadRef::cell(graph))
-    }
-
-    #[turbo_tasks::function]
-    pub fn from_entry_module(
-        module: ResolvedVc<Box<dyn Module>>,
-        include_traced: bool,
-        include_binding_usage: bool,
-    ) -> Vc<Self> {
-        Self::from_single_graph(SingleModuleGraph::new_with_entries(
-            ResolvedVc::cell(vec![ChunkGroupEntry::Entry(vec![module])]),
-            include_traced,
-            include_binding_usage,
-        ))
-    }
-
-    #[turbo_tasks::function]
-    pub fn from_modules(
-        modules: ResolvedVc<GraphEntries>,
-        include_traced: bool,
-        include_binding_usage: bool,
-    ) -> Vc<Self> {
-        Self::from_single_graph(SingleModuleGraph::new_with_entries(
-            modules,
-            include_traced,
-            include_binding_usage,
-        ))
     }
 
     #[turbo_tasks::function(operation)]
@@ -923,15 +913,6 @@ impl ModuleGraph {
             .collect();
 
         Ok(AsyncModuleInfo::new(referenced_modules))
-    }
-
-    // TODO remove this method and use `from_graphs_without_unused_references` directly
-    #[turbo_tasks::function]
-    pub fn without_unused_references(
-        &self,
-        binding_usage: OperationVc<BindingUsageInfo>,
-    ) -> Vc<Self> {
-        Self::from_graphs_without_unused_references(self.input_graphs.clone(), binding_usage)
     }
 
     /// Returns the underlying graphs as a list, to be used for individual graph traversals.
@@ -1503,13 +1484,28 @@ impl ModuleGraph {
 #[turbo_tasks::value_impl]
 impl SingleModuleGraph {
     #[turbo_tasks::function(operation)]
+    pub async fn new_with_entry(
+        entry: ChunkGroupEntry,
+        include_traced: bool,
+        include_binding_usage: bool,
+    ) -> Result<Vc<Self>> {
+        SingleModuleGraph::new_inner(
+            vec![entry],
+            &Default::default(),
+            include_traced,
+            include_binding_usage,
+        )
+        .await
+    }
+
+    #[turbo_tasks::function(operation)]
     pub async fn new_with_entries(
         entries: ResolvedVc<GraphEntries>,
         include_traced: bool,
         include_binding_usage: bool,
     ) -> Result<Vc<Self>> {
         SingleModuleGraph::new_inner(
-            &*entries.await?,
+            entries.owned().await?,
             &Default::default(),
             include_traced,
             include_binding_usage,
@@ -1525,7 +1521,7 @@ impl SingleModuleGraph {
         include_binding_usage: bool,
     ) -> Result<Vc<Self>> {
         SingleModuleGraph::new_inner(
-            &*entries.await?,
+            entries.owned().await?,
             &visited_modules.connect().await?.modules,
             include_traced,
             include_binding_usage,
@@ -1542,7 +1538,7 @@ impl SingleModuleGraph {
         include_binding_usage: bool,
     ) -> Result<Vc<Self>> {
         SingleModuleGraph::new_inner(
-            &entries,
+            entries,
             &visited_modules.connect().await?.modules,
             include_traced,
             include_binding_usage,
@@ -2127,7 +2123,8 @@ pub mod tests {
                     false,
                     false,
                 ),
-            ]);
+            ])
+            .connect();
             let child_graph = module_graph
                 .iter_graphs()
                 .await?
@@ -2378,7 +2375,7 @@ pub mod tests {
                 .into_iter()
                 .collect();
             test_fn(
-                &*ModuleGraph::from_single_graph(graph).await?,
+                &*ModuleGraph::from_single_graph(graph).connect().await?,
                 entry_modules,
                 module_to_name,
             )
