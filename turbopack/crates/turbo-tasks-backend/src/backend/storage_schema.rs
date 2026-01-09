@@ -3,21 +3,24 @@
 //! This module defines the complete schema for task storage using the TaskStorage derive macro.
 //! The schema covers all 37 CachedDataItem variants with appropriate storage types and categories.
 //!
-//! # Storage Types
+//! # Storage Types (`storage = "..."`)
 //!
 //! - `direct` - For single optional values (e.g., Output, Dirty, AggregationNumber)
 //! - `auto_set` - For sets of keys with unit values (e.g., Child, OutputDependency)
 //! - `counter_map` - For maps with counted references (e.g., Upper, Follower, Collectible)
 //! - `auto_map` - For maps with non-counter values (e.g., CellData)
+//! - `auto_multimap` - For maps with set values (e.g., CellDependents)
+//! - `flag` - For boolean flags stored in TaskFlags bitfield
 //!
-//! # Categories
+//! # Categories (`category = "..."`)
 //!
 //! - `data` - Frequently changed bulk data (dependencies, cell data)
 //! - `meta` - Rarely changed metadata (output, aggregation, flags)
-//!
-//! # Transient Fields
-//!
-//! Fields marked with `transient` are not serialized and only exist in memory.
+//! - `transient` - Not serialized, only exists in memory
+
+// TODO(PR 2): Remove this once the storage schema is integrated with the rest of the codebase.
+// This module is scaffolding for the TaskStorage macro and is not yet used.
+#![allow(dead_code)]
 
 use rustc_hash::FxHashSet;
 use turbo_tasks::{
@@ -94,7 +97,7 @@ pub struct TaskStorageSchema {
     pub aggregated_collectibles: CounterMap<CollectibleRef, i32>,
 
     /// Outdated collectibles to be cleaned up (transient).
-    #[task_storage(storage = "counter_map", category = "meta", transient)]
+    #[task_storage(storage = "counter_map", category = "transient")]
     pub outdated_collectibles: CounterMap<CollectibleRef, i32>,
 
     // =========================================================================
@@ -116,16 +119,16 @@ pub struct TaskStorageSchema {
     pub aggregated_dirty_containers: CounterMap<TaskId, i32>,
 
     /// Whether clean in current session (transient flag).
-    #[task_storage(flag, transient)]
+    #[task_storage(storage = "flag", category = "transient")]
     pub current_session_clean: bool,
 
     /// Count of clean containers in current session (transient).
     /// Absent = 0, present = actual count.
-    #[task_storage(storage = "direct", category = "meta", transient)]
+    #[task_storage(storage = "direct", category = "transient")]
     pub aggregated_current_session_clean_container_count: i32,
 
     /// Individual clean containers in current session (transient).
-    #[task_storage(storage = "counter_map", category = "meta", transient)]
+    #[task_storage(storage = "counter_map", category = "transient")]
     pub aggregated_current_session_clean_containers: CounterMap<TaskId, i32>,
 
     // =========================================================================
@@ -133,11 +136,11 @@ pub struct TaskStorageSchema {
     // Persisted flags come first, then transient flags.
     // =========================================================================
     /// Whether the task has an invalidator.
-    #[task_storage(storage = "direct", flag, category = "meta")]
-    pub invalidator: Option<()>,
+    #[task_storage(storage = "flag", category = "meta")]
+    pub invalidator: bool,
 
     /// Whether the task output is immutable (persisted).
-    #[task_storage(flag)]
+    #[task_storage(storage = "flag", category = "meta")]
     pub immutable: bool,
 
     // =========================================================================
@@ -145,31 +148,31 @@ pub struct TaskStorageSchema {
     // These flags track internal state for persistence and snapshotting.
     // =========================================================================
     /// Whether meta data has been restored from persistent storage.
-    #[task_storage(flag, transient)]
+    #[task_storage(storage = "flag", category = "transient")]
     pub meta_restored: bool,
 
     /// Whether data has been restored from persistent storage.
-    #[task_storage(flag, transient)]
+    #[task_storage(storage = "flag", category = "transient")]
     pub data_restored: bool,
 
     /// Whether meta was modified before snapshot mode was entered.
-    #[task_storage(flag, transient)]
+    #[task_storage(storage = "flag", category = "transient")]
     pub meta_modified: bool,
 
     /// Whether data was modified before snapshot mode was entered.
-    #[task_storage(flag, transient)]
+    #[task_storage(storage = "flag", category = "transient")]
     pub data_modified: bool,
 
     /// Whether meta was modified after snapshot mode was entered (snapshot taken).
-    #[task_storage(flag, transient)]
+    #[task_storage(storage = "flag", category = "transient")]
     pub meta_snapshot: bool,
 
     /// Whether data was modified after snapshot mode was entered (snapshot taken).
-    #[task_storage(flag, transient)]
+    #[task_storage(storage = "flag", category = "transient")]
     pub data_snapshot: bool,
 
     /// Whether dependencies have been prefetched.
-    #[task_storage(flag, transient)]
+    #[task_storage(storage = "flag", category = "transient")]
     pub prefetched: bool,
 
     // =========================================================================
@@ -199,15 +202,15 @@ pub struct TaskStorageSchema {
     pub collectibles_dependencies: AutoSet<CollectiblesRef>,
 
     /// Outdated output dependencies to be cleaned up (transient).
-    #[task_storage(storage = "auto_set", category = "data", transient)]
+    #[task_storage(storage = "auto_set", category = "transient")]
     pub outdated_output_dependencies: AutoSet<TaskId>,
 
     /// Outdated cell dependencies to be cleaned up (transient).
-    #[task_storage(storage = "auto_set", category = "data", transient)]
+    #[task_storage(storage = "auto_set", category = "transient")]
     pub outdated_cell_dependencies: AutoSet<CellRef>,
 
     /// Outdated collectibles dependencies to be cleaned up (transient).
-    #[task_storage(storage = "auto_set", category = "data", transient)]
+    #[task_storage(storage = "auto_set", category = "transient")]
     pub outdated_collectibles_dependencies: AutoSet<CollectiblesRef>,
 
     // =========================================================================
@@ -233,7 +236,7 @@ pub struct TaskStorageSchema {
     pub cell_data: AutoMap<CellId, TypedSharedReference>,
 
     /// Transient cell data (not serializable).
-    #[task_storage(storage = "auto_map", category = "data", transient)]
+    #[task_storage(storage = "auto_map", category = "transient")]
     pub transient_cell_data: AutoMap<CellId, SharedReference>,
 
     /// Maximum cell index per cell type.
@@ -246,17 +249,17 @@ pub struct TaskStorageSchema {
     /// Activeness state for root/once tasks (transient).
     /// Note: Lazy storage provides natural optionality -
     /// presence in Vec<LazyField> = Some, absence = None. No Option wrapper needed.
-    #[task_storage(storage = "direct", category = "meta", transient)]
+    #[task_storage(storage = "direct", category = "transient")]
     pub activeness: ActivenessState,
 
     /// In-progress execution state (transient).
     /// Note: Lazy storage provides natural optionality -
     /// presence in Vec<LazyField> = Some, absence = None. No Option wrapper needed.
-    #[task_storage(storage = "direct", category = "meta", transient)]
+    #[task_storage(storage = "direct", category = "transient")]
     pub in_progress: InProgressState,
 
     /// In-progress cell state for cells being computed (transient).
-    #[task_storage(storage = "auto_map", category = "meta", transient)]
+    #[task_storage(storage = "auto_map", category = "transient")]
     pub in_progress_cells: AutoMap<CellId, InProgressCellState>,
 }
 
@@ -1089,14 +1092,6 @@ mod tests {
 
     #[test]
     fn test_schema_size() {
-        // AggregationNumber is 12 bytes (3 x u32).
-        assert_eq!(
-            size_of::<AggregationNumber>(),
-            12,
-            "AggregationNumber size changed! Was 12 bytes, now {} bytes.",
-            size_of::<AggregationNumber>()
-        );
-
         // TaskStorage uses lazy storage for most fields, keeping inline storage minimal.
         // Current layout (128 bytes):
         //   - output_dependent (AutoSet<TaskId>): 24 bytes
@@ -1114,80 +1109,6 @@ mod tests {
             "TaskStorage size changed! Was 128 bytes, now {} bytes. If this is intentional, \
              update this test.",
             size_of::<TaskStorage>()
-        );
-    }
-
-    #[test]
-    fn size_breakdown() {
-        println!("\n=== Size Breakdown ===\n");
-
-        // Each FxHashMap/FxHashSet is 56 bytes when empty
-        println!(
-            "FxHashMap<TaskId, u32>: {} bytes",
-            size_of::<rustc_hash::FxHashMap<TaskId, u32>>()
-        );
-        println!(
-            "FxHashSet<TaskId>: {} bytes",
-            size_of::<rustc_hash::FxHashSet<TaskId>>()
-        );
-
-        // Vec is 24 bytes (ptr + len + cap)
-        println!("Vec<u8>: {} bytes", size_of::<Vec<u8>>());
-
-        // Option<()> is 1 byte
-        println!("Option<()>: {} bytes", size_of::<Option<()>>());
-
-        println!("\n=== TaskStorage (Unified with lazy) ===\n");
-        println!("TaskStorage total: {} bytes", size_of::<TaskStorage>());
-        println!("\nSpecialized fields (inline):");
-        println!(
-            "  - output_dependent (FxHashSet<TaskId>): {} bytes",
-            size_of::<AutoSet<TaskId>>()
-        );
-        println!(
-            "  - aggregation_number: {} bytes",
-            size_of::<AggregationNumber>()
-        );
-        println!("  - output: {} bytes", size_of::<Option<OutputValue>>());
-        println!(
-            "  - upper (CounterMap<TaskId, u32>): {} bytes",
-            size_of::<CounterMap<TaskId, u32>>()
-        );
-        println!("\nDirect fields (inline):");
-        println!(
-            "  - invalidator/immutable: 2 * {} bytes",
-            size_of::<Option<()>>()
-        );
-        println!(
-            "  - dirty: {} bytes",
-            size_of::<Option<crate::data::Dirtyness>>()
-        );
-        println!(
-            "  - aggregated_dirty_container_count: {} bytes",
-            size_of::<Option<i32>>()
-        );
-        println!(
-            "  - aggregated_dirty_containers: {} bytes",
-            size_of::<CounterMap<TaskId, i32>>()
-        );
-
-        println!("\nLazy Vec (stores all lazy fields):");
-        println!(
-            "  - lazy: Vec<LazyField> = {} bytes",
-            size_of::<Vec<LazyField>>()
-        );
-        println!("  - LazyField enum size: {} bytes", size_of::<LazyField>());
-
-        println!("\n=== Lazy Field Analysis ===\n");
-        // With lazy: all lazy fields in one Vec<LazyField> = 24 bytes
-        // Without lazy: 7 Option<Box<_>> = 56 bytes
-        println!(
-            "Vec<LazyField> = {} bytes (stores all lazy fields)",
-            size_of::<Vec<LazyField>>()
-        );
-        println!(
-            "Savings vs 7 Option<Box<_>>: {} bytes",
-            7 * 8 - size_of::<Vec<LazyField>>()
         );
     }
 }

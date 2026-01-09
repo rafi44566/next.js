@@ -16,23 +16,32 @@ use syn::{
 ///
 /// # Field Attributes
 ///
-/// - `#[task_storage(storage = "...")]` - Specifies the storage type:
-///   - `direct` - Direct field access (e.g., `Option<OutputValue>`)
-///   - `auto_set` - Uses AutoSet for small collections
-///   - `auto_map` - Uses AutoMap for key-value pairs
-///   - `counter_map` - Uses CounterMap for reference counting
+/// All fields require two attributes:
 ///
-/// - `#[task_storage(category = "...")]` - Data vs Meta categorization:
-///   - `data` - Frequently changed, bulk I/O
-///   - `meta` - Rarely changed, small I/O
+/// ## `storage = "..."` (required)
 ///
-/// - `#[task_storage(inline)]` - Field is stored inline on TaskStorage (default is lazy). Only use
-///   for hot-path fields that are frequently accessed.
+/// Specifies how the field is stored:
+/// - `direct` - Direct field access (e.g., `Option<OutputValue>`)
+/// - `auto_set` - Uses AutoSet for small collections
+/// - `auto_map` - Uses AutoMap for key-value pairs
+/// - `auto_multimap` - Uses AutoMultimap for key -> set-of-values
+/// - `counter_map` - Uses CounterMap for reference counting
+/// - `flag` - Boolean flag stored in a compact TaskFlags bitfield (field type must be `bool`)
 ///
-/// - `#[task_storage(transient)]` - Field is not serialized
+/// ## `category = "..."` (required)
 ///
-/// - `#[task_storage(flag)]` - Field is a boolean flag stored in a bitfield. The field type must be
-///   `bool`. Flags are stored in a compact `TaskFlags` bitfield.
+/// Specifies the data category for persistence and access:
+/// - `data` - Frequently changed, bulk I/O
+/// - `meta` - Rarely changed, small I/O
+/// - `transient` - Field is not serialized (in-memory only)
+///
+/// ## Optional Modifiers
+///
+/// - `inline` - Field is stored inline on TaskStorage (default is lazy). Only use for hot-path
+///   fields that are frequently accessed.
+/// - `default` - Use `Default::default()` semantics instead of `Option` for inline direct fields.
+/// - `filter_transient` - Filter out transient values during serialization. For AutoMultimap
+///   fields, transient filtering is always applied to inner set values automatically.
 pub fn derive_task_storage(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -85,30 +94,33 @@ struct FieldInfo {
     /// If true, field is lazily allocated in Vec<LazyField> (the default).
     /// If false (marked with `inline`), field is stored directly on TaskStorage.
     lazy: bool,
-    /// If true, field is not serialized (skipped in bincode)
-    transient: bool,
-    /// If true, field is a boolean flag stored in the TaskFlags bitfield
-    flag: bool,
     /// If true, filter out values that reference transient tasks during encoding.
     /// For direct fields: skip encoding if value.is_transient() returns true.
     /// For collections: filter out entries where key/value is_transient() returns true.
+    /// For AutoMultimap: filter is always applied to inner set values automatically.
     filter_transient: bool,
-    /// If true, filter transient entries from nested collections in map values.
-    /// Used for fields like `AutoMap<CellId, FxHashSet<TaskId>>` where the key doesn't
-    /// need filtering but the set values do.
-    filter_transient_values: bool,
     /// If true, use Default::default() semantics instead of Option for inline direct fields.
     /// The field type should be T (not Option<T>), and empty is represented by T::default().
     use_default: bool,
 }
 
 impl FieldInfo {
+    /// Whether this field is a boolean flag stored in the TaskFlags bitfield.
+    fn is_flag(&self) -> bool {
+        self.storage_type == StorageType::Flag
+    }
+
+    /// Whether this field is transient (not serialized, in-memory only).
+    fn is_transient(&self) -> bool {
+        self.category == Category::Transient
+    }
+
     /// Generate the `TaskDataCategory` enum variant for `check_access` calls.
     ///
     /// Returns the appropriate category based on whether the field is transient
     /// and its data category (meta vs data).
     fn check_access_category(&self) -> proc_macro2::TokenStream {
-        if self.transient {
+        if self.is_transient() {
             // Transient fields use TaskDataCategory::All
             quote! { crate::backend::TaskDataCategory::All }
         } else if self.category == Category::Meta {
@@ -316,12 +328,14 @@ enum StorageType {
     AutoMap,
     AutoMultimap,
     CounterMap,
+    Flag,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Category {
     Data,
     Meta,
+    Transient,
 }
 
 fn parse_field_storage_attributes(field: &syn::Field) -> FieldInfo {
@@ -332,13 +346,10 @@ fn parse_field_storage_attributes(field: &syn::Field) -> FieldInfo {
     let variant_name = syn::Ident::new(&to_pascal_case(&field_name.to_string()), field_name.span());
 
     // Default values
-    let mut storage_type = StorageType::Direct;
-    let mut category = Category::Data;
+    let mut storage_type: Option<StorageType> = None;
+    let mut category: Option<Category> = None;
     let mut inline = false; // Default is lazy (not inline)
-    let mut transient = false;
-    let mut flag = false;
     let mut filter_transient = false;
-    let mut filter_transient_values = false;
     let mut use_default = false;
 
     // Parse attributes
@@ -377,51 +388,54 @@ fn parse_field_storage_attributes(field: &syn::Field) -> FieldInfo {
                             ..
                         }) = &nv.value
                     {
-                        storage_type = match lit_str.value().as_str() {
+                        storage_type = Some(match lit_str.value().as_str() {
                             "direct" => StorageType::Direct,
                             "auto_set" => StorageType::AutoSet,
                             "auto_map" => StorageType::AutoMap,
                             "auto_multimap" => StorageType::AutoMultimap,
                             "counter_map" => StorageType::CounterMap,
+                            "flag" => StorageType::Flag,
                             other => {
                                 meta.span()
                                     .unwrap()
-                                    .error(format!("unknown storage type: {other}"))
+                                    .error(format!(
+                                        "unknown storage type: {other}. Expected \"direct\", \
+                                         \"auto_set\", \"auto_map\", \"auto_multimap\", \
+                                         \"counter_map\", or \"flag\""
+                                    ))
                                     .emit();
                                 continue;
                             }
-                        };
+                        });
                     } else if *ident == "category"
                         && let syn::Expr::Lit(syn::ExprLit {
                             lit: syn::Lit::Str(lit_str),
                             ..
                         }) = &nv.value
                     {
-                        category = match lit_str.value().as_str() {
+                        category = Some(match lit_str.value().as_str() {
                             "data" => Category::Data,
                             "meta" => Category::Meta,
+                            "transient" => Category::Transient,
                             other => {
                                 meta.span()
                                     .unwrap()
-                                    .error(format!("unknown category: {other}"))
+                                    .error(format!(
+                                        "unknown category: {other}. Expected \"data\", \"meta\", \
+                                         or \"transient\""
+                                    ))
                                     .emit();
                                 continue;
                             }
-                        };
+                        });
                     }
                 }
                 Meta::Path(path) => {
                     if let Some(ident) = path.get_ident() {
                         if *ident == "inline" {
                             inline = true;
-                        } else if *ident == "transient" {
-                            transient = true;
-                        } else if *ident == "flag" {
-                            flag = true;
                         } else if *ident == "filter_transient" {
                             filter_transient = true;
-                        } else if *ident == "filter_transient_values" {
-                            filter_transient_values = true;
                         } else if *ident == "default" {
                             use_default = true;
                         }
@@ -432,6 +446,42 @@ fn parse_field_storage_attributes(field: &syn::Field) -> FieldInfo {
         }
     }
 
+    // Require explicit storage type
+    let storage_type = match storage_type {
+        Some(st) => st,
+        None => {
+            field_name
+                .span()
+                .unwrap()
+                .error(format!(
+                    "field `{}` requires explicit storage type. Add #[task_storage(storage = \
+                     \"...\")]. Valid types: \"direct\", \"auto_set\", \"auto_map\", \
+                     \"auto_multimap\", \"counter_map\", \"flag\"",
+                    field_name
+                ))
+                .emit();
+            StorageType::Direct // Default to avoid cascading errors
+        }
+    };
+
+    // Require explicit category for all fields
+    let category = match category {
+        Some(cat) => cat,
+        None => {
+            field_name
+                .span()
+                .unwrap()
+                .error(format!(
+                    "field `{}` requires explicit category. Add #[task_storage(category = \
+                     \"data\")], #[task_storage(category = \"meta\")], or #[task_storage(category \
+                     = \"transient\")]",
+                    field_name
+                ))
+                .emit();
+            Category::Data // Default to avoid cascading errors
+        }
+    };
+
     FieldInfo {
         field_name,
         variant_name,
@@ -439,10 +489,7 @@ fn parse_field_storage_attributes(field: &syn::Field) -> FieldInfo {
         storage_type,
         category,
         lazy: !inline, // Default is lazy; inline = true means lazy = false
-        transient,
-        flag,
         filter_transient,
-        filter_transient_values,
         use_default,
     }
 }
@@ -470,12 +517,16 @@ impl GroupedFields {
 
     /// Returns an iterator over persisted (non-transient) flag fields.
     fn persisted_flags(&self) -> impl Iterator<Item = &FieldInfo> {
-        self.fields.iter().filter(|f| f.flag && !f.transient)
+        self.fields
+            .iter()
+            .filter(|f| f.is_flag() && !f.is_transient())
     }
 
     /// Returns an iterator over transient flag fields.
     fn transient_flags(&self) -> impl Iterator<Item = &FieldInfo> {
-        self.fields.iter().filter(|f| f.flag && f.transient)
+        self.fields
+            .iter()
+            .filter(|f| f.is_flag() && f.is_transient())
     }
 
     /// Returns the count of persisted flag fields.
@@ -485,7 +536,7 @@ impl GroupedFields {
 
     /// Returns true if there are any flag fields.
     fn has_flags(&self) -> bool {
-        self.fields.iter().any(|f| f.flag)
+        self.fields.iter().any(|f| f.is_flag())
     }
 
     // =========================================================================
@@ -494,22 +545,22 @@ impl GroupedFields {
 
     /// Returns an iterator over all non-flag fields.
     fn all_fields(&self) -> impl Iterator<Item = &FieldInfo> {
-        self.fields.iter().filter(|f| !f.flag)
+        self.fields.iter().filter(|f| !f.is_flag())
     }
 
     /// Returns an iterator over all lazy fields (both data and meta categories).
     fn all_lazy(&self) -> impl Iterator<Item = &FieldInfo> {
-        self.fields.iter().filter(|f| !f.flag && f.lazy)
+        self.fields.iter().filter(|f| !f.is_flag() && f.lazy)
     }
 
     /// Returns true if there are any lazy fields.
     fn has_lazy(&self) -> bool {
-        self.fields.iter().any(|f| !f.flag && f.lazy)
+        self.fields.iter().any(|f| !f.is_flag() && f.lazy)
     }
 
     /// Returns an iterator over all inline (non-lazy, non-flag) fields.
     fn all_inline(&self) -> impl Iterator<Item = &FieldInfo> {
-        self.fields.iter().filter(|f| !f.flag && !f.lazy)
+        self.fields.iter().filter(|f| !f.is_flag() && !f.lazy)
     }
 
     // =========================================================================
@@ -520,28 +571,28 @@ impl GroupedFields {
     fn inline_data(&self) -> impl Iterator<Item = &FieldInfo> {
         self.fields
             .iter()
-            .filter(|f| !f.flag && !f.lazy && f.category == Category::Data)
+            .filter(|f| !f.is_flag() && !f.lazy && f.category == Category::Data)
     }
 
     /// Returns an iterator over inline meta fields.
     fn inline_meta(&self) -> impl Iterator<Item = &FieldInfo> {
         self.fields
             .iter()
-            .filter(|f| !f.flag && !f.lazy && f.category == Category::Meta)
+            .filter(|f| !f.is_flag() && !f.lazy && f.category == Category::Meta)
     }
 
     /// Returns an iterator over lazy data fields.
     fn lazy_data(&self) -> impl Iterator<Item = &FieldInfo> {
         self.fields
             .iter()
-            .filter(|f| !f.flag && f.lazy && f.category == Category::Data)
+            .filter(|f| !f.is_flag() && f.lazy && f.category == Category::Data)
     }
 
     /// Returns an iterator over lazy meta fields.
     fn lazy_meta(&self) -> impl Iterator<Item = &FieldInfo> {
         self.fields
             .iter()
-            .filter(|f| !f.flag && f.lazy && f.category == Category::Meta)
+            .filter(|f| !f.is_flag() && f.lazy && f.category == Category::Meta)
     }
 
     // =========================================================================
@@ -550,22 +601,22 @@ impl GroupedFields {
 
     /// Returns an iterator over persistent (non-transient) inline meta fields.
     fn persistent_inline_meta(&self) -> impl Iterator<Item = &FieldInfo> {
-        self.inline_meta().filter(|f| !f.transient)
+        self.inline_meta().filter(|f| !f.is_transient())
     }
 
     /// Returns an iterator over persistent (non-transient) inline data fields.
     fn persistent_inline_data(&self) -> impl Iterator<Item = &FieldInfo> {
-        self.inline_data().filter(|f| !f.transient)
+        self.inline_data().filter(|f| !f.is_transient())
     }
 
     /// Returns an iterator over persistent (non-transient) lazy meta fields.
     fn persistent_lazy_meta(&self) -> impl Iterator<Item = &FieldInfo> {
-        self.lazy_meta().filter(|f| !f.transient)
+        self.lazy_meta().filter(|f| !f.is_transient())
     }
 
     /// Returns an iterator over persistent (non-transient) lazy data fields.
     fn persistent_lazy_data(&self) -> impl Iterator<Item = &FieldInfo> {
-        self.lazy_data().filter(|f| !f.transient)
+        self.lazy_data().filter(|f| !f.is_transient())
     }
 }
 
@@ -839,7 +890,7 @@ fn generate_lazy_field_enum(grouped_fields: &GroupedFields) -> proc_macro2::Toke
         .iter()
         .map(|field| {
             let variant_name = &field.variant_name;
-            let is_persistent = !field.transient;
+            let is_persistent = !field.is_transient();
             quote! {
                 LazyField::#variant_name(_) => #is_persistent
             }
@@ -994,6 +1045,10 @@ fn generate_field_accessors(field: &FieldInfo) -> proc_macro2::TokenStream {
         | StorageType::AutoMultimap
         | StorageType::CounterMap => {
             generate_collection_field_accessors(field, field_name, field_type)
+        }
+        StorageType::Flag => {
+            // Flag fields have accessors generated on TaskFlags, not TaskStorage
+            unreachable!("Flag fields should not reach generate_field_accessors")
         }
     }
 }
@@ -1379,6 +1434,10 @@ fn generate_trait_accessor_methods(field: &FieldInfo) -> proc_macro2::TokenStrea
                 #base_accessor
                 #automultimap_ops
             }
+        }
+        StorageType::Flag => {
+            // Flag fields have accessors generated on TaskFlags, not TaskStorageAccessors
+            unreachable!("Flag fields should not reach generate_trait_accessor_methods")
         }
     }
 }
@@ -2233,7 +2292,7 @@ fn generate_flag_trait_accessor_methods(field: &FieldInfo) -> proc_macro2::Token
 
     // Flags are stored inline in TaskStorage's flags bitfield, which is meta category.
     // For check_access, transient flags use All, non-transient flags use Meta.
-    let check_access_category = if field.transient {
+    let check_access_category = if field.is_transient() {
         quote! { crate::backend::TaskDataCategory::All }
     } else {
         quote! { crate::backend::TaskDataCategory::Meta }
@@ -2452,15 +2511,6 @@ fn generate_filter_predicate(
         ));
     }
 
-    // For AutoMap with filter_transient_values (legacy: maps with set values that aren't
-    // AutoMultimap)
-    if field.filter_transient_values && field.storage_type == StorageType::AutoMap {
-        return Some((
-            quote! { |(_, v)| v.iter().any(|item| !item.is_transient()) },
-            FilterPredicateType::MapWithSetValues,
-        ));
-    }
-
     if !field.filter_transient {
         return None;
     }
@@ -2480,6 +2530,10 @@ fn generate_filter_predicate(
             FilterPredicateType::Map,
         )),
         StorageType::AutoMultimap => unreachable!("AutoMultimap handled above"),
+        StorageType::Flag => {
+            // Flags are encoded in TaskFlags bitfield, not individually
+            unreachable!("Flag fields should not reach generate_filter_predicate")
+        }
     }
 }
 
