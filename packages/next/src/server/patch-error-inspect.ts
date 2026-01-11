@@ -243,14 +243,17 @@ function parseEvalOrigin(
  */
 function captureCallSite(callSite: CallSite): CapturedFrame {
   let fileName = callSite.getFileName() ?? undefined
-  const lineNumber = callSite.getLineNumber() ?? undefined
-  const columnNumber = callSite.getColumnNumber() ?? undefined
+  let lineNumber = callSite.getLineNumber() ?? undefined
+  let columnNumber = callSite.getColumnNumber() ?? undefined
 
   // For eval frames, getFileName() returns undefined but getEvalOrigin() contains the source location.
-  // When using eval-source-map (common in webpack dev mode), the sourceURL comment in the eval'd code
-  // causes V8 to set evalOrigin to just the sourceURL (e.g., "webpack-internal:///(rsc)/./app/page.tsx").
-  // The lineNumber/columnNumber are positions within the eval'd code which will be source-mapped.
-  // When NOT using sourceURL, evalOrigin has format "eval at <name> (file:line:col)" and we extract the file.
+  // There are two formats:
+  // 1. Traditional eval: "eval at <name> (webpack-internal:///.../page.js:10:5)" - extract file:line:col
+  // 2. eval-source-map: just "webpack-internal:///.../page.js" (sourceURL in eval'd code) - use as fileName
+  //
+  // For case 1, we must use the line:col from the eval origin (position in the source file)
+  // because getLineNumber/getColumnNumber return positions in the eval'd code which don't map correctly.
+  // For case 2, the getLineNumber/getColumnNumber positions ARE correct for source mapping.
   if (fileName === undefined && callSite.isEval()) {
     const evalOrigin = callSite.getEvalOrigin()
     if (evalOrigin) {
@@ -258,7 +261,8 @@ function captureCallSite(callSite: CallSite): CapturedFrame {
       const parsed = parseEvalOrigin(evalOrigin)
       if (parsed) {
         fileName = parsed.file
-        // Don't override lineNumber/columnNumber - they're positions in eval code that need source mapping
+        lineNumber = parsed.line
+        columnNumber = parsed.column
       } else {
         // evalOrigin is just the sourceURL from eval-source-map
         fileName = evalOrigin
@@ -653,7 +657,10 @@ function ignoreListAnonymousStackFramesIfSandwiched(
 ) {
   return ignoreListAnonymousStackFramesIfSandwichedGeneric(
     sourceMappedFrames,
-    (frame) => frame.stack.file === '<anonymous>',
+    // Native functions (Set.forEach, JSON.stringify, etc.) have null file names
+    // when captured via CallSite, but may have '<anonymous>' as string when
+    // the frames come from parsing the stack string (fallback path).
+    (frame) => frame.stack.file === null || frame.stack.file === '<anonymous>',
     (frame) => frame.stack.ignored,
     (frame) => frame.stack.methodName,
     (frame) => {
