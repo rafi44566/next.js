@@ -18,10 +18,6 @@
 //! - `meta` - Rarely changed metadata (output, aggregation, flags)
 //! - `transient` - Not serialized, only exists in memory
 
-// TODO(PR 2): Remove this once the storage schema is integrated with the rest of the codebase.
-// This module is scaffolding for the TaskStorage macro and is not yet used.
-#![allow(dead_code)]
-
 use rustc_hash::FxHashSet;
 use turbo_tasks::{
     CellId, SharedReference, TaskId, TraitTypeId, TypedSharedReference, ValueTypeId,
@@ -683,36 +679,4 @@ impl<K: Hash + Eq, V: CounterValue> CounterMapExt<K, V> for CounterMap<K, V> {
             }
         }
     }
-}
-
-// ==========================================================================
-// TaskStorage Serialization Helpers
-// ==========================================================================
-
-/// Serialize TaskStorage meta fields directly to bytes.
-/// Uses the generated encode_meta method for efficient serialization.
-pub fn serialize_task_storage_meta(
-    storage: &TaskStorage,
-) -> Result<turbo_bincode::TurboBincodeBuffer, bincode::error::EncodeError> {
-    let mut buffer = turbo_bincode::TurboBincodeBuffer::new();
-    let mut encoder = bincode::enc::EncoderImpl::new(
-        turbo_bincode::TurboBincodeWriter::new(&mut buffer),
-        turbo_bincode::TURBO_BINCODE_CONFIG,
-    );
-    storage.encode_meta(&mut encoder)?;
-    Ok(buffer)
-}
-
-/// Serialize TaskStorage data fields directly to bytes.
-/// Uses the generated encode_data method for efficient serialization.
-pub fn serialize_task_storage_data(
-    storage: &TaskStorage,
-) -> Result<turbo_bincode::TurboBincodeBuffer, bincode::error::EncodeError> {
-    let mut buffer = turbo_bincode::TurboBincodeBuffer::new();
-    let mut encoder = bincode::enc::EncoderImpl::new(
-        turbo_bincode::TurboBincodeWriter::new(&mut buffer),
-        turbo_bincode::TURBO_BINCODE_CONFIG,
-    );
-    storage.encode_data(&mut encoder)?;
-    Ok(buffer)
 }
