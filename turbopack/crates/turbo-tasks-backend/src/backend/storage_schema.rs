@@ -680,3 +680,212 @@ impl<K: Hash + Eq, V: CounterValue> CounterMapExt<K, V> for CounterMap<K, V> {
         }
     }
 }
+
+// =============================================================================
+// CachedDataItem Adapter Extension Methods
+// =============================================================================
+//
+// These methods provide backward compatibility with the CachedDataItem API
+// while the codebase migrates to typed accessors. The adapter layer is
+// intentionally kept simple - performance-critical code should use the typed
+// accessor methods directly (e.g., `task.set_output(value)` instead of
+// `task.insert(CachedDataItem::Output { value })`).
+//
+// ## Performance Notes
+//
+// Some adapter methods have suboptimal performance due to the enum-based API:
+//
+// - `add()`: Two lookups when key doesn't exist (contains_key + insert_kv). This matches the old
+//   Storage::add semantics.
+//
+// - `update()`: Up to 3 lookups (remove + contains_key + insert_kv) instead of 1 with entry API.
+//   Typed accessors use single-lookup patterns.
+//
+// - `get_mut_or_insert_with()`: 2-3 lookups + key clone instead of 1 lookup with entry API.
+//
+// - `extract_if()`: Collects keys first, then removes one by one. O(n) allocations + O(n) lookups.
+//
+// These inefficiencies are acceptable for this compatibility layer. The next
+// PR will migrate callers to typed accessors, eliminating this overhead.
+// =============================================================================
+
+/// Extension trait for CachedDataItem adapter methods.
+///
+/// This trait provides simple wrapper methods that delegate to the generated
+/// match-arm methods. Separating these improves code readability by keeping
+/// the macro-generated code focused on the type-dispatching match arms.
+pub trait CachedDataItemAdapterExt: CachedDataItemAdapter {
+    /// Add a CachedDataItem to storage.
+    ///
+    /// Returns `true` if the item was newly added, `false` if it already existed.
+    /// Does NOT overwrite if the key already exists.
+    ///
+    /// Note: This performs two lookups when the key doesn't exist (contains_key + insert_kv).
+    /// For better performance, use typed accessors directly.
+    fn add(&mut self, item: crate::data::CachedDataItem) -> bool {
+        use turbo_tasks::KeyValuePair;
+        let (key, value) = item.into_key_and_value();
+        // Check first - add should not overwrite existing values
+        if self.contains_key(&key) {
+            return false;
+        }
+        self.insert_kv(key, value);
+        true
+    }
+
+    /// Insert a CachedDataItem, returning the old value if present.
+    fn insert(
+        &mut self,
+        item: crate::data::CachedDataItem,
+    ) -> Option<crate::data::CachedDataItemValue> {
+        use turbo_tasks::KeyValuePair;
+        let (key, value) = item.into_key_and_value();
+        self.insert_kv(key, value)
+    }
+
+    /// Check if a key exists in storage.
+    fn contains_key(&self, key: &crate::data::CachedDataItemKey) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Update a value in-place, creating it if it doesn't exist.
+    ///
+    /// Note: This performs up to 3 lookups (remove + contains_key + insert_kv).
+    /// For better performance, use typed accessors with entry-style APIs.
+    fn update(
+        &mut self,
+        key: crate::data::CachedDataItemKey,
+        update: impl FnOnce(
+            Option<crate::data::CachedDataItemValue>,
+        ) -> Option<crate::data::CachedDataItemValue>,
+    ) {
+        use turbo_tasks::KeyValuePair;
+        let old_value = self.remove(&key);
+        if let Some(new_value) = update(old_value) {
+            let item = crate::data::CachedDataItem::from_key_and_value(key, new_value);
+            self.add(item);
+        }
+    }
+
+    /// Get a mutable reference or insert a value created by the given closure.
+    ///
+    /// Note: This performs 2-3 lookups + key clone instead of 1 lookup with entry API.
+    /// For better performance, use typed accessors directly.
+    fn get_mut_or_insert_with(
+        &mut self,
+        key: crate::data::CachedDataItemKey,
+        insert: impl FnOnce() -> crate::data::CachedDataItemValue,
+    ) -> crate::data::CachedDataItemValueRefMut<'_> {
+        if self.get(&key).is_none() {
+            let value = insert();
+            self.insert_kv(key.clone(), value);
+        }
+        self.get_mut(&key).expect("just inserted")
+    }
+
+    /// Extend storage with items from an iterator.
+    /// Returns `true` if all items were newly added, `false` if any already existed.
+    fn extend(
+        &mut self,
+        _ty: crate::data::CachedDataItemType,
+        items: impl IntoIterator<Item = crate::data::CachedDataItem>,
+    ) -> bool {
+        let mut all_new = true;
+        for item in items {
+            if !self.add(item) {
+                all_new = false;
+            }
+        }
+        all_new
+    }
+
+    /// Remove items matching a predicate.
+    ///
+    /// Note: This collects keys first, then removes one by one - O(n) allocations + O(n) lookups.
+    /// For better performance, use typed accessors with extract_if on the underlying collection.
+    fn extract_if<'a, F>(
+        &'a mut self,
+        ty: crate::data::CachedDataItemType,
+        mut predicate: F,
+    ) -> Vec<crate::data::CachedDataItem>
+    where
+        F: for<'b> FnMut(
+                crate::data::CachedDataItemKey,
+                crate::data::CachedDataItemValueRef<'b>,
+            ) -> bool
+            + 'a,
+    {
+        use turbo_tasks::KeyValuePair;
+        // Collect keys to remove (can't mutate while iterating)
+        let keys_to_remove: Vec<_> = self
+            .iter(ty)
+            .filter_map(|(key, value_ref)| {
+                if predicate(key.clone(), value_ref) {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Remove and collect matching items
+        keys_to_remove
+            .into_iter()
+            .filter_map(|key| {
+                self.remove(&key)
+                    .map(|value| crate::data::CachedDataItem::from_key_and_value(key, value))
+            })
+            .collect()
+    }
+}
+
+/// Auto-implement for all types that implement CachedDataItemAdapter.
+impl<T: CachedDataItemAdapter> CachedDataItemAdapterExt for T {}
+
+/// Core trait for CachedDataItem adapter methods with generated match arms.
+///
+/// This trait is implemented by the TaskStorage derive macro and contains the
+/// type-dispatching match arms that route to typed accessors. The simpler
+/// wrapper methods are provided by `CachedDataItemAdapterExt`.
+pub trait CachedDataItemAdapter {
+    /// Insert a key-value pair, returning the old value if present.
+    fn insert_kv(
+        &mut self,
+        key: crate::data::CachedDataItemKey,
+        value: crate::data::CachedDataItemValue,
+    ) -> Option<crate::data::CachedDataItemValue>;
+
+    /// Get a reference to a CachedDataItem value by key.
+    fn get(
+        &self,
+        key: &crate::data::CachedDataItemKey,
+    ) -> Option<crate::data::CachedDataItemValueRef<'_>>;
+
+    /// Remove a CachedDataItem by key, returning the value if present.
+    fn remove(
+        &mut self,
+        key: &crate::data::CachedDataItemKey,
+    ) -> Option<crate::data::CachedDataItemValue>;
+
+    /// Get a mutable reference to a CachedDataItem value by key.
+    fn get_mut(
+        &mut self,
+        key: &crate::data::CachedDataItemKey,
+    ) -> Option<crate::data::CachedDataItemValueRefMut<'_>>;
+
+    /// Count items of a specific type.
+    fn count(&self, ty: crate::data::CachedDataItemType) -> usize;
+
+    /// Iterate over items of a specific type.
+    fn iter(
+        &self,
+        ty: crate::data::CachedDataItemType,
+    ) -> Box<
+        dyn Iterator<
+                Item = (
+                    crate::data::CachedDataItemKey,
+                    crate::data::CachedDataItemValueRef<'_>,
+                ),
+            > + '_,
+    >;
+}
